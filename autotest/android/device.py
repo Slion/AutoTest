@@ -169,8 +169,8 @@ class AndroidDevice(Device):
     def webview_focused(self) -> bool:
         return adb.webview_focused(self.serial)
 
-    def ime_shown(self) -> bool:
-        return adb.ime_shown(self.serial)
+    def ime_shown(self, timeout: float = 0.0) -> bool:
+        return adb.ime_shown(self.serial, timeout=timeout)
 
     def dropdown_present(self) -> bool:
         return adb.dropdown_present(self.serial)

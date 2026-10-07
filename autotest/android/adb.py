@@ -29,6 +29,9 @@ from pathlib import Path
 
 # --- Key codes used for chords (see autotest.keys for the semantic symbols) --
 KEY_CTRL_LEFT = 113
+KEY_CTRL_RIGHT = 114
+KEY_SHIFT_LEFT = 59
+KEY_SHIFT_RIGHT = 60
 KEY_TAB = 61
 KEY_CTRL_W = 51  # closes the current tab in a tabbed app
 KEY_MOVE_END = 123
@@ -194,15 +197,27 @@ def screen_size(serial: str) -> tuple[int, int]:
 def foreground_package(serial: str) -> str | None:
     """Package of the top resumed (foreground) activity, if any.
 
-    Handles both dumpsys formats: newer Android prints ``mResumedActivity=``
-    while Android 11 (e.g. the SHIELD TV) prints ``mResumedActivity:`` — the
-    separator is ``=`` or ``:`` (the colon form must not be confused with the
-    ``ActivityRecord{... u0 pkg/act`` token, which is why the package is
-    captured from after the ``u0`` user marker).
+    ``dumpsys activity activities`` spells the resumed-activity field
+    differently across versions: Android 10 prints both ``mResumedActivity:``
+    and a bare ``ResumedActivity:``; Android 11 (e.g. the SHIELD TV) prints
+    ``mResumedActivity:``; Android 13+ (e.g. the Galaxy A22) prints a bare
+    ``ResumedActivity:`` with NO ``m``/``top`` prefix. A single anchored regex
+    that only knows the ``m``/``top`` forms silently returns None on the bare
+    form — and ``settle()`` treats None as "not foregrounded" and re-launches
+    the app in a loop, so the page never settles. Match ANY ``ResumedActivity``
+    marker line (scanning for the first one, as the old global regex did) but
+    skip the ``mLastResumedActivity`` field, which holds the *previous*
+    foreground activity. The package is captured from after the ``u0`` user
+    marker (the colon in ``ActivityRecord{... u0 pkg/act}`` must not be read
+    as the field separator).
     """
     out = _adb(serial, ["shell", "dumpsys", "activity", "activities"])
-    m = re.search(r"(?:topResumedActivity|mResumedActivity)[=:].*?([\w.]+)/", out)
-    return m.group(1) if m else None
+    for line in out.splitlines():
+        if "ResumedActivity" in line and "LastResumedActivity" not in line:
+            m = re.search(r"u0\s+([\w.]+)/", line)
+            if m:
+                return m.group(1)
+    return None
 
 
 def wait_until(predicate: Callable[[], bool], timeout: float = 10.0, interval: float = 0.3) -> bool:
@@ -304,6 +319,29 @@ def _api_level(serial: str) -> int:
     return _api_levels[serial]
 
 
+def can_hold_key(serial: str, reason: str | None = None) -> bool:
+    """Whether a *precise* key hold (``key_hold``) is deliverable to this device.
+
+    ``key_hold`` uses ``input keyevent --duration`` (API 34+) or
+    ``input keycombination -t`` (API 30-33) natively. On API < 30 it falls back
+    to a raw ``sendevent`` chord into an input node — but whether the input
+    reader actually routes an injected key from such a node to the app is
+    device-specific (a Huawei P30 Pro on Android 10 has no node the reader
+    honours for key injection, so the fallback is inert there and the hold is
+    silently lost). Tests that depend on a *precise* hold duration (e.g. the
+    cursor context-menu long press) should check this and skip rather than fail.
+
+    ``reason`` (when given) receives a skip note on a ``False`` result,
+    mirroring the established ``ctx["notes"]`` skip-report pattern.
+    """
+    ok = _api_level(serial) >= 30
+    if not ok and reason is not None:
+        reason.append(
+            "skipped: a precise key hold is not deliverable on this device "
+            "(API < 30 — no reliable way to hold a key for an exact duration)")
+    return ok
+
+
 def key_hold(serial: str, keycode: int, ms: int, wait: float = 0.3) -> None:
     """Press and hold a key for ``ms`` milliseconds, then release it.
 
@@ -314,13 +352,17 @@ def key_hold(serial: str, keycode: int, ms: int, wait: float = 0.3) -> None:
     The call blocks for the hold duration (both paths do):
 
     - Android 14+ (API 34): ``input keyevent --duration <ms>``.
-    - Older: ``input keycombination -t <ms> <CTRL_LEFT> <key>`` — a single-key chord held
-      for ``ms``; CTRL_LEFT is an inert partner for a lone key.
+    - Android 11+ (API 30-33): ``input keycombination -t <ms> <CTRL_LEFT> <key>`` —
+      a single-key chord held for ``ms``; CTRL_LEFT is an inert partner for a lone key.
+    - API < 30: ``sendevent`` key injection — ``input keycombination`` does not exist
+      there (verified on Android 10 / EMUI 10: 'Unknown command: keycombination').
     """
     if _api_level(serial) >= 34:
         _adb(serial, ["shell", "input", "keyevent", "--duration", str(ms), str(keycode)], timeout=max(30, ms // 1000 + 5))
-    else:
+    elif _api_level(serial) >= 30:
         _adb(serial, ["shell", "input", "keycombination", "-t", str(ms), str(KEY_CTRL_LEFT), str(keycode)], timeout=max(30, ms // 1000 + 5))
+    else:
+        _key_chord_sendevent(serial, [keycode], [KEY_CTRL_LEFT], ms)
     time.sleep(wait)
 
 
@@ -340,14 +382,59 @@ def tap_longpress(serial: str, x: int, y: int, hold_ms: int = 800, wait: float =
     time.sleep(wait)
 
 
+def _key_chord_sendevent(serial: str, keys: list, modifiers: list, hold_ms: int = 0) -> None:
+    """Deliver a key chord (e.g. CTRL+B) via raw ``sendevent`` injection.
+
+    Needed on API < 30, where ``input keycombination`` does not exist (Android 10
+    rejects it with 'Unknown command: keycombination' — the chord is silently
+    lost, which broke every Ctrl-chord-driven feature there). The modifier is
+    held DOWN, the key is pressed (held ``hold_ms`` when non-zero), then both
+    are released, each step SYN-synchronised — the same shape a physical
+    keyboard produces, so the app's ``metaState`` handling sees a real
+    CTRL-modified key.
+    """
+    node = find_input_node(serial, "virtual")
+    if node is None:
+        # Fall back to the first keyboard node (some builds name it differently).
+        for n, _name in input_devices(serial):
+            node = n
+            break
+    if node is None:
+        raise RuntimeError(f"no input node available for sendevent on {serial}")
+
+    def ev(code: int, val: int) -> str:
+        return f"sendevent {node} 0001 {code:04x} {val & 0xffff:04x}"
+
+    def syn() -> str:
+        return f"sendevent {node} 0001 0000 0000"
+
+    steps = [ev(k, 1) for k in modifiers]
+    steps += [ev(k, 1) for k in keys]
+    if hold_ms > 0:
+        _adb(serial, ["shell", " && ".join(steps + [syn()])], timeout=20)
+        time.sleep(hold_ms / 1000.0)
+        steps = [ev(k, 0) for k in keys]
+    else:
+        steps += [syn()]
+        steps += [ev(k, 0) for k in keys]
+    steps += [ev(k, 0) for k in modifiers]
+    _adb(serial, ["shell", " && ".join(steps + [syn()])], timeout=20)
+
+
 def key_combination(serial: str, *keycodes: int, wait: float = 0.6) -> None:
     """Send a chord of keys pressed together (e.g. CTRL+TAB).
 
-    Uses `input keycombination` (Android 10+), which is the only reliable way to
-    deliver a modified key like CTRL+TAB over adb; plain `input keyevent` cannot
-    hold a modifier down across another key.
+    Uses `input keycombination` (API 30+), the only built-in way to deliver a
+    modified key like CTRL+TAB over adb — plain `input keyevent` cannot hold a
+    modifier down across another key. On API < 30 the command does not exist
+    (Android 10 rejects it), so a raw `sendevent` chord is injected instead.
     """
-    _adb(serial, ["shell", "input", "keycombination", *[str(k) for k in keycodes]])
+    if _api_level(serial) >= 30:
+        _adb(serial, ["shell", "input", "keycombination", *[str(k) for k in keycodes]])
+    else:
+        modifiers = [k for k in keycodes if k in (KEY_CTRL_LEFT, KEY_CTRL_RIGHT, KEY_SHIFT_LEFT, KEY_SHIFT_RIGHT)]
+        plain = [k for k in keycodes if k not in modifiers]
+        _key_chord_sendevent(serial, plain, modifiers, hold_ms=100)
     time.sleep(wait)
 
 
@@ -523,10 +610,39 @@ def webview_focused(serial: str) -> bool:
     return False
 
 
-def ime_shown(serial: str) -> bool:
-    out = _adb(serial, ["shell", "dumpsys", "input_method"])
-    m = re.search(r"mInputShown=(\w+)", out)
-    return bool(m and m.group(1) == "true")
+def ime_shown(serial: str, timeout: float = 0.0) -> bool:
+    """True if the on-screen keyboard is shown.
+
+    Two independent signals are combined (either one suffices):
+
+    1. ``dumpsys input_method`` → ``mInputShown=true``.  Works on AOSP and
+       most OEM builds, but **EMUI 10 (Huawei P30 Pro) leaves it ``false``
+       for the entire time the keyboard is visible** — verified by screenshot
+       while the flag stayed false for > 5 s.
+
+    2. ``dumpsys window windows`` → ``mInputMethodWindow=Window{…}``.  The
+       window manager sets this whenever an IME window is active, regardless
+       of the input-method subsystem's own bookkeeping.  On EMUI 10 this is
+       the only reliable signal.
+
+    ``timeout > 0`` polls until either signal is set or the deadline passes
+    (useful on builds where the flag lags 0-3 s).  The default (0.0) keeps a
+    single-shot read for backward compatibility.
+    """
+    deadline = time.time() + timeout
+    while True:
+        # Signal 1: the input-method flag (AOSP / most OEM).
+        out = _adb(serial, ["shell", "dumpsys", "input_method"])
+        m = re.search(r"mInputShown=(\w+)", out)
+        if m and m.group(1) == "true":
+            return True
+        # Signal 2: the window-manager's active IME window (EMUI 10 fallback).
+        wout = _adb(serial, ["shell", "dumpsys", "window", "windows"])
+        if "mInputMethodWindow=Window{" in wout:
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.3)
 
 
 def dropdown_present(serial: str) -> bool:

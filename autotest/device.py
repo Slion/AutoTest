@@ -177,8 +177,13 @@ class Device(abc.ABC):
         """True if a WebView node has focus."""
 
     @abc.abstractmethod
-    def ime_shown(self) -> bool:
-        """True if the on-screen keyboard is shown."""
+    def ime_shown(self, timeout: float = 0.0) -> bool:
+        """True if the on-screen keyboard is shown.
+
+        ``timeout > 0`` polls until the keyboard is reported shown or the
+        deadline passes (some OEM builds update the shown-state flag a few
+        seconds late); 0 keeps a single-shot read.
+        """
 
     @abc.abstractmethod
     def dropdown_present(self) -> bool:
