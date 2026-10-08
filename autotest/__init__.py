@@ -38,6 +38,7 @@ from .transport import Transport
 from .android.adb import resolve_devices as _adb_resolve_devices
 from .android.device import AdbTransport, AndroidDevice
 from .runner import Runner, Suite, select_tests
+from .watch import CrashWatcher
 
 __all__ = [
     "keys",
@@ -51,6 +52,7 @@ __all__ = [
     "Runner",
     "Suite",
     "select_tests",
+    "CrashWatcher",
     "resolve_android_devices",
     "ORIENTATIONS",
 ]

@@ -165,6 +165,28 @@ def force_stop(serial: str, package: str) -> None:
     _adb(serial, ["shell", "am", "force-stop", package])
 
 
+def app_pid(serial: str, package: str) -> str:
+    """The app's process id(s) as printed by ``pidof`` (``""`` if not running)."""
+    return _adb(serial, ["shell", "pidof", package], timeout=10).strip()
+
+
+def crash_logcat(serial: str) -> str:
+    """A recent crash-log excerpt for the device, or ``""`` if there is no crash.
+
+    Sources, in order: the dedicated crash buffer, then the FATAL tags in the
+    main buffer (``-s`` silent+spec — some ROMs ignore the positional
+    ``tag:level`` form once ``-t`` is present). Only content that actually
+    carries a crash marker is returned, so a healthy device yields ``""``
+    rather than a page of unrelated log.
+    """
+    crash = _adb(serial, ["shell", "logcat", "-d", "-b", "crash"], timeout=30).strip()
+    if "FATAL" in crash or "AndroidRuntime" in crash:
+        return crash
+    fatal = _adb(serial, ["shell", "logcat", "-d", "-s", "AndroidRuntime:E", "DEBUG:E"],
+                 timeout=30).strip()
+    return fatal if "FATAL" in fatal or "AndroidRuntime" in fatal else ""
+
+
 _leanback_cache: dict[str, bool] = {}
 
 
@@ -176,15 +198,8 @@ def is_leanback(serial: str) -> bool:
     return _leanback_cache[serial]
 
 
-def screen_size(serial: str) -> tuple[int, int]:
-    """Logical (app) screen size in pixels, parsed from `wm size`.
-
-    `input tap` / `keyevent` use LOGICAL coordinates, which is the *override* size when one is
-    set (e.g. a 4K panel driven at 1080p: `Physical size: 3840x2160` / `Override size: 1920x1080`)
-    and the *physical* size otherwise. The physical line is printed first, so taking the first
-    ``NxN`` would tap the wrong place on such a device (a "center" tap lands off-page). Prefer an
-    override when present, then the physical size, then any size. Falls back to a sane default.
-    """
+def _natural_size(serial: str) -> tuple[int, int]:
+    """The natural-orientation app size: `wm size`'s override if set, else physical."""
     out = _adb(serial, ["shell", "wm", "size"])
     m = re.search(r"Override size:\s*(\d+)x(\d+)", out)
     if not m:
@@ -192,6 +207,27 @@ def screen_size(serial: str) -> tuple[int, int]:
     if not m:
         m = re.search(r"(\d+)x(\d+)", out)
     return (int(m.group(1)), int(m.group(2))) if m else (1920, 1080)
+
+
+def screen_size(serial: str) -> tuple[int, int]:
+    """Screen size in pixels in the CURRENT (rotated) orientation.
+
+    This is the coordinate space `uiautomator dump` node bounds and `input
+    tap`/`swipe` use, so every tap/swipe calculation must be based on this —
+    NOT on the physical size, which on a rotated device (landscape phone,
+    foldable) is the dimensions swapped and sends swipes off-screen. Read the
+    live ``cur=WxH`` from `dumpsys window displays` (the default display);
+    fall back to the natural size (override if set, else physical) swapped
+    when the display is currently landscape.
+    """
+    out = _adb(serial, ["shell", "dumpsys", "window", "displays"])
+    m = re.search(r"cur=(\d+)x(\d+)", out)
+    if m:
+        return (int(m.group(1)), int(m.group(2)))
+    w, h = _natural_size(serial)
+    if user_rotation(serial) in (ROTATION_90, ROTATION_270):
+        return (h, w)
+    return (w, h)
 
 
 def foreground_package(serial: str) -> str | None:

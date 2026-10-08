@@ -147,6 +147,12 @@ class AndroidDevice(Device):
     def force_stop(self) -> None:
         adb.force_stop(self.serial, self._package)
 
+    def app_alive(self) -> bool:
+        return bool(adb.app_pid(self.serial, self._package))
+
+    def crash_evidence(self) -> str:
+        return adb.crash_logcat(self.serial)
+
     def settle(self, timeout: float = 60.0) -> bool:
         # Generic readiness: the app is at least foregrounded. The app profile
         # tightens this to "its main UI is up".

@@ -137,6 +137,14 @@ class Device(abc.ABC):
         """Force-stop the app."""
 
     @abc.abstractmethod
+    def app_alive(self) -> bool:
+        """Whether the app's process is currently running."""
+
+    @abc.abstractmethod
+    def crash_evidence(self) -> str:
+        """A recent crash-log excerpt (may be empty if there is no crash)."""
+
+    @abc.abstractmethod
     def settle(self, timeout: float = 60.0) -> bool:
         """Wait until the app is foregrounded and its main UI is ready.
 

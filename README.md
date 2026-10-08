@@ -24,6 +24,7 @@ autotest/
 ├── session.py       # per-run state: restart policy + opened-unit (tab) hygiene
 ├── results.py       # per device-model + config persistence & regression diff
 ├── runner.py        # the group-based Runner + Suite
+├── watch.py         # CrashWatcher — detect the app dying mid-run
 └── android/
     ├── adb.py       # the generic Android-over-adb driver (pure stdlib)
     └── device.py    # AndroidDevice — the platform impl of Device
@@ -76,7 +77,17 @@ def test_smoke_open_website(device, ctx):
     assert device.foreground_package() == device.package
     assert device.field_text(), "address bar should show the page label"
 ```
+### Crash detection
 
+The runner wraps every test in a `CrashWatcher`, which polls
+`device.app_alive()` in a background thread. When the app process dies mid-test
+the test is recorded as `CRASH` with the crash-log tail (`device.crash_evidence()`,
+from the logcat crash buffer) and the run **stops for that device** — a dead app
+makes every following test fail for the same reason. A test that ends with the
+app process gone fails the same way, so a never-launching app is caught on the
+first test instead of burning the whole suite. Tests must therefore leave the
+app process running (restart it at the end if they need it stopped). Disable
+with `watch_crashes=False` on `Runner.run()`.
 Group it via each suite module's `FEATURE_GROUPS`; the reserved group `"all"`
 runs every test. The runner records results per device model + configuration
 with regression comparison (see `autotest.results`).
