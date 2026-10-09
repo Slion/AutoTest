@@ -127,7 +127,16 @@ class Runner:
             restart: bool = False, keep_tabs: bool = False, orientation: str | None = None,
             no_save: bool = False, notify: bool = False, list: bool = False,
             watch_crashes: bool = True) -> int:
-        """Execute the selected tests on the selected device(s); return an exit code."""
+        """Execute the selected tests on the selected device(s); return an exit code.
+
+        ``orientation`` accepts ``"portrait"``, ``"landscape"`` and ``"sensor"``
+        (the device is rotated, then restored afterwards), plus ``"current"``:
+        the device's rotation is NOT touched, its orientation is detected, and
+        tests that declare an ``orientations`` attribute (a tuple of
+        ``"portrait"``/``"landscape"``) are only run when the detected
+        orientation is among them. With no ``orientation`` at all the device is
+        left as-is and no orientation filtering happens.
+        """
         # Device logs can carry bytes the console encoding cannot render (e.g.
         # cp1252 on Windows); replace them rather than crashing the run.
         try:
@@ -163,16 +172,39 @@ class Runner:
         for dev in devices:
             dev.session = session
             saved_state = None
-            if orientation:
+            if orientation and orientation != "current":
                 saved_state = dev.orientation_state()
                 dev.set_orientation(orientation)
             # Capture the config AFTER the requested orientation is applied, so
             # the record is keyed by the configuration the tests actually ran in.
             config = dev.config()
+            # The orientation the tests run in: the device's actual one whenever
+            # we are not leaving the rotation untouched (a forced value matches
+            # the config; "current" and "sensor" are detected from it). With no
+            # orientation at all there is no filtering.
+            effective_orientation = None if orientation is None else config["orientation"]
             print(f"\n=== {dev.label()}  [{dev.package}] ===")
             print(f"  config: {config['config_id']}  "
                   f"({config['orientation']}, rot {config['rotation']}\u00b0, "
                   f"sw{config['smallest_width_dp']}dp, Android {config['android']})")
+            if orientation == "current":
+                print(f"  orientation: current (device left as-is; "
+                      f"tests for '{config['orientation']}' will run)")
+
+            # A test may declare which orientations it applies to (a tuple
+            # attribute, e.g. ``t.orientations = ("landscape",)``); tests that
+            # do not apply to the run's orientation are skipped, not failed.
+            run_tests, skipped = [], []
+            for t in tests:
+                allowed = getattr(t, "orientations", None)
+                if allowed and effective_orientation not in allowed:
+                    skipped.append((t, allowed))
+                else:
+                    run_tests.append(t)
+            for t, allowed in skipped:
+                print(f"  SKIP  {t.__name__}  (only {'/'.join(allowed)}, "
+                      f"device is {effective_orientation})")
+            tests = run_tests
 
             ctx: dict = {"notes": []}
             passed = 0
